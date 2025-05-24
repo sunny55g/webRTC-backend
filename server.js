@@ -11,9 +11,7 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 
 // MongoDB
-
 const mongoClient = new MongoClient(process.env.MONGO_URI);
-
 let messagesCollection;
 
 async function connectToMongo() {
@@ -24,26 +22,20 @@ async function connectToMongo() {
         console.log("✅ MongoDB connected");
     } catch (err) {
         console.error("❌ MongoDB connection failed:");
-        console.error(err.stack); // full error details
-        process.exit(1); // Optional: stop server if MongoDB fails
+        console.error(err.stack);
+        process.exit(1);
     }
 }
 
 connectToMongo();
 
-
-// REST endpoint (optional)
 app.get('/messages', async (req, res) => {
     if (!messagesCollection) return res.status(500).send("MongoDB not ready");
     const messages = await messagesCollection.find().sort({ timestamp: 1 }).toArray();
     res.json(messages);
 });
 
-
-// Create HTTP server
 const server = http.createServer(app);
-
-// ✅ Attach WebSocket to the same HTTP server
 const wss = new WebSocket.Server({ server });
 
 const clients = new Map();
@@ -51,7 +43,7 @@ let clientIdCounter = 1;
 
 wss.on('connection', (ws) => {
     const clientId = clientIdCounter++;
-    let clientData = { id: clientId, name: `User${clientId}`, target: null };
+    const clientData = { id: clientId, name: `User${clientId}`, target: null };
     clients.set(ws, clientData);
 
     ws.on('message', async (message) => {
@@ -61,27 +53,44 @@ wss.on('connection', (ws) => {
 
             switch (data.type) {
                 case 'init':
-                   // Check for name conflict
-                   for (let [clientSocket, clientData] of clients.entries()) {
-                       if (clientData.name === data.name) {
-                           ws.send(JSON.stringify({
-                               type: 'error',
-                               message: 'Name already in use. Please choose another.'
-                           }));
-                          ws.close(); // force disconnect
-                           return;
-                       }
-                   }
+                    // Prevent name reuse
+                    for (let [otherWs, otherClient] of clients.entries()) {
+                        if (otherClient.name === data.name && otherWs !== ws) {
+                            ws.send(JSON.stringify({
+                                type: 'error',
+                                message: 'Name already in use. Please choose another.'
+                            }));
+                            ws.close();
+                            return;
+                        }
+                    }
 
-                   client.name = data.name;
-                   client.target = data.target;
-                   console.log(`✅ ${data.name} connected with target ${data.target}`);
-                  break;
-               
+                    // Save client details
+                    client.name = data.name;
+                    client.target = `${data.targetIP}:${data.targetPort}`;
+                    console.log(`✅ ${client.name} connected (targeting ${client.target})`);
+
+                    ws.send(JSON.stringify({
+                        type: 'init',
+                        name: 'Server',
+                        isServer: true
+                    }));
+
+                    // Check for matching peer
+                    for (let [otherWs, otherClient] of clients.entries()) {
+                        if (
+                            otherWs !== ws &&
+                            otherClient.name === client.target &&
+                            otherClient.target === client.name
+                        ) {
+                            console.log(`🔁 Matched: ${client.name} ↔ ${otherClient.name}`);
+                            // Optionally notify both clients they are matched
+                        }
+                    }
+                    break;
 
                 case 'message':
                     console.log(`💬 ${client.name} → ${client.target}: ${data.content}`);
-
                     if (messagesCollection) {
                         await messagesCollection.insertOne({
                             sender: client.name,
@@ -91,7 +100,6 @@ wss.on('connection', (ws) => {
                         });
                     }
 
-                    // Send to all other clients who share the same target
                     for (let [otherWs, otherClient] of clients.entries()) {
                         if (
                             otherWs !== ws &&
@@ -107,25 +115,22 @@ wss.on('connection', (ws) => {
                         }
                     }
                     break;
-                    case 'signal':
-                      // Forward signaling data (SDP/ICE) to target peer
-                     for (let [otherWs, otherClient] of clients.entries()) {
-                         if (
-                             otherWs !== ws &&
-                             otherClient.target === client.target &&
-                             otherWs.readyState === WebSocket.OPEN
-                         ) {
-                             otherWs.send(JSON.stringify({
-                                 type: 'signal',
-                                 from: client.name,
-                                 data: data.data // contains SDP or ICE
-                             }));
-                         }
-                     }
-                     break;
 
-
-                
+                case 'signal':
+                    // Forward signal to the intended peer by matching name
+                    for (let [otherWs, otherClient] of clients.entries()) {
+                        if (
+                            otherClient.name === client.target &&
+                            otherWs.readyState === WebSocket.OPEN
+                        ) {
+                            otherWs.send(JSON.stringify({
+                                type: 'signal',
+                                from: client.name,
+                                data: data.data
+                            }));
+                        }
+                    }
+                    break;
 
                 default:
                     console.warn('Unknown message type:', data.type);
@@ -148,7 +153,6 @@ wss.on('connection', (ws) => {
     }));
 });
 
-
 function broadcastMessage(sender, message) {
     clients.forEach((_, ws) => {
         if (ws !== sender && ws.readyState === WebSocket.OPEN) {
@@ -157,7 +161,6 @@ function broadcastMessage(sender, message) {
     });
 }
 
-// ✅ Start server (both Express and WebSocket)
 server.listen(PORT, () => {
     console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
