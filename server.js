@@ -115,22 +115,23 @@ wss.on('connection', (ws) => {
                         }
                     }
                     break;
+case 'signal':
+    // Relay signaling to the client whose name matches this client's target
+    for (let [otherWs, otherClient] of clients.entries()) {
+        if (
+            otherClient.name === client.target &&
+            otherWs.readyState === WebSocket.OPEN
+        ) {
+            console.log(`📨 Relaying signal from ${client.name} to ${otherClient.name}`);
+            otherWs.send(JSON.stringify({
+                type: 'signal',
+                from: client.name,
+                data: data.data
+            }));
+        }
+    }
+    break;
 
-                case 'signal':
-                    // Forward signal to the intended peer by matching name
-                    for (let [otherWs, otherClient] of clients.entries()) {
-                        if (
-                            otherClient.name === client.target &&
-                            otherWs.readyState === WebSocket.OPEN
-                        ) {
-                            otherWs.send(JSON.stringify({
-                                type: 'signal',
-                                from: client.name,
-                                data: data.data
-                            }));
-                        }
-                    }
-                    break;
 
                 default:
                     console.warn('Unknown message type:', data.type);
