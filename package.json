@@ -1,31 +1,25 @@
 
 {
-  "name": "webrtc-p2p-signaling-server",
+  "name": "webrtc-signaling-server",
   "version": "1.0.0",
-  "description": "WebRTC P2P Signaling Server for direct peer connections",
+  "description": "WebRTC signaling server for peer-to-peer connections",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js"
   },
-  "engines": {
-    "node": ">=16.0.0"
-  },
+  "keywords": ["webrtc", "signaling", "websocket", "p2p"],
+  "author": "Your Name",
+  "license": "MIT",
   "dependencies": {
     "express": "^4.18.2",
     "ws": "^8.14.2",
-    "cors": "^2.8.5",
-    "dotenv": "^16.3.1"
+    "cors": "^2.8.5"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
   },
-  "keywords": [
-    "webrtc",
-    "peer-to-peer",
-    "signaling",
-    "websocket"
-  ],
-  "author": "WebRTC P2P Terminal",
-  "license": "MIT"
+  "engines": {
+    "node": ">=16.0.0"
+  }
 }
