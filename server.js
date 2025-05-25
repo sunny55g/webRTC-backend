@@ -1,209 +1,265 @@
+
+const express = require('express');
+const WebSocket = require('ws');
+const cors = require('cors');
 require('dotenv').config();
 
-const net = require('net');
-const WebSocket = require('ws');
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-class TCPWebRTCBridge {
+// Enable CORS for all origins (adjust for production)
+app.use(cors({
+    origin: ['https://zesty-licorice-70a7d5.netlify.app/', 'http://localhost:5173', 'http://localhost:3000'],
+    credentials: true
+}));
+
+app.use(express.json());
+
+// Health check endpoint
+app.get('/', (req, res) => {
+    res.json({ 
+        status: 'WebRTC P2P Signaling Server Running',
+        timestamp: new Date().toISOString(),
+        connectedPeers: peers.size
+    });
+});
+
+// Create HTTP server
+const server = require('http').createServer(app);
+
+// Create WebSocket server
+const wss = new WebSocket.Server({ server });
+
+// Store connected peers
+const peers = new Map();
+
+class SignalingServer {
     constructor() {
-        this.connections = new Map();
-        this.tcpClients = new Map();
         this.setupWebSocketServer();
-        this.setupHTTPServer();
+        console.log('WebRTC P2P Signaling Server initialized');
     }
 
     setupWebSocketServer() {
-        this.wss = new WebSocket.Server({ port: 8081 });
-        console.log('WebSocket signaling server running on port 8081');
-
-        this.wss.on('connection', (ws) => {
-            console.log('New WebSocket connection');
+        wss.on('connection', (ws, req) => {
+            console.log('New WebSocket connection from:', req.socket.remoteAddress);
             
             ws.on('message', (data) => {
                 try {
                     const message = JSON.parse(data);
-                    this.handleWebSocketMessage(ws, message);
+                    this.handleMessage(ws, message);
                 } catch (error) {
-                    console.error('Error parsing WebSocket message:', error);
+                    console.error('Invalid JSON message:', error);
+                    ws.send(JSON.stringify({
+                        type: 'error',
+                        message: 'Invalid message format'
+                    }));
                 }
             });
-
+            
             ws.on('close', () => {
+                this.handleDisconnection(ws);
                 console.log('WebSocket connection closed');
-                this.removeConnection(ws);
             });
-
+            
             ws.on('error', (error) => {
                 console.error('WebSocket error:', error);
+                this.handleDisconnection(ws);
             });
         });
     }
 
-    setupHTTPServer() {
-        const server = http.createServer((req, res) => {
-            let filePath = path.join(__dirname, req.url === '/' ? 'index.html' : req.url);
-            const extname = path.extname(filePath);
-            
-            let contentType = 'text/html';
-            switch (extname) {
-                case '.css': contentType = 'text/css'; break;
-                case '.js': contentType = 'text/javascript'; break;
-                case '.json': contentType = 'application/json'; break;
-            }
-
-            fs.readFile(filePath, (err, content) => {
-                if (err) {
-                    res.writeHead(404);
-                    res.end('File not found');
-                } else {
-                    res.writeHead(200, { 'Content-Type': contentType });
-                    res.end(content);
-                }
-            });
-        });
-
-        server.listen(3000, () => {
-            console.log('HTTP server running on http://localhost:3000');
-        });
-    }
-
-    handleWebSocketMessage(ws, message) {
+    handleMessage(ws, message) {
+        console.log('Received message:', message.type, message.localAddress || '');
+        
         switch (message.type) {
-            case 'join':
-                this.handleJoin(ws, message);
+            case 'register':
+                this.handleRegister(ws, message);
                 break;
+                
             case 'offer':
+                this.handleOffer(message);
+                break;
+                
             case 'answer':
+                this.handleAnswer(message);
+                break;
+                
             case 'ice-candidate':
-                this.relaySignalingMessage(ws, message);
+                this.handleIceCandidate(message);
                 break;
-            case 'tcp-bridge':
-                this.handleTCPBridge(ws, message);
-                break;
-        }
-    }
-
-    handleJoin(ws, message) {
-        const { room, username, isHost } = message;
-        
-        if (!this.connections.has(room)) {
-            this.connections.set(room, []);
-        }
-        
-        const roomConnections = this.connections.get(room);
-        roomConnections.push({ ws, username, isHost });
-        
-        ws.room = room;
-        ws.username = username;
-        ws.isHost = isHost;
-
-        console.log(`${username} joined room ${room} as ${isHost ? 'host' : 'client'}`);
-
-        // Notify others in the room
-        roomConnections.forEach(conn => {
-            if (conn.ws !== ws) {
-                conn.ws.send(JSON.stringify({
-                    type: 'user-joined',
-                    username,
-                    isHost,
-                    room
+                
+            default:
+                console.warn('Unknown message type:', message.type);
+                ws.send(JSON.stringify({
+                    type: 'error',
+                    message: 'Unknown message type'
                 }));
-            }
-        });
-
-        // Setup TCP server if this is a host
-        if (isHost) {
-            this.setupTCPServer(room);
         }
     }
 
-    relaySignalingMessage(senderWs, message) {
-        const room = message.room || senderWs.room;
-        if (!room || !this.connections.has(room)) return;
-
-        const roomConnections = this.connections.get(room);
-        roomConnections.forEach(conn => {
-            if (conn.ws !== senderWs && conn.ws.readyState === WebSocket.OPEN) {
-                conn.ws.send(JSON.stringify(message));
-            }
-        });
-    }
-
-    setupTCPServer(room) {
-        const [ip, port] = room.split(':');
-        const tcpPort = parseInt(port);
-
-        if (this.tcpClients.has(room)) {
-            return; // Already setup
+    handleRegister(ws, message) {
+        const { localAddress, targetAddress, username, mode } = message;
+        
+        if (!localAddress || !targetAddress || !username || !mode) {
+            ws.send(JSON.stringify({
+                type: 'error',
+                message: 'Missing required registration parameters'
+            }));
+            return;
         }
-
-        const tcpServer = net.createServer((socket) => {
-            console.log(`TCP client connected to ${room}`);
-            
-            socket.on('data', (data) => {
-                // Forward TCP data to WebRTC clients
-                this.forwardToWebRTC(room, data.toString());
-            });
-
-            socket.on('close', () => {
-                console.log(`TCP client disconnected from ${room}`);
-            });
-
-            socket.on('error', (error) => {
-                console.error(`TCP socket error for ${room}:`, error);
-            });
-
-            // Store the socket for this room
-            this.tcpClients.set(room, socket);
-        });
-
-        tcpServer.listen(tcpPort, ip, () => {
-            console.log(`TCP server listening on ${ip}:${tcpPort}`);
-        });
-
-        tcpServer.on('error', (error) => {
-            console.error(`TCP server error for ${room}:`, error);
-        });
-    }
-
-    forwardToWebRTC(room, data) {
-        if (!this.connections.has(room)) return;
-
-        const message = {
-            type: 'tcp-message',
-            sender: 'TCP Client',
-            content: data.trim(),
-            timestamp: new Date().toISOString()
+        
+        // Store peer information
+        const peerInfo = {
+            ws,
+            localAddress,
+            targetAddress,
+            username,
+            mode,
+            connected: false
         };
-
-        const roomConnections = this.connections.get(room);
-        roomConnections.forEach(conn => {
-            if (conn.ws.readyState === WebSocket.OPEN) {
-                conn.ws.send(JSON.stringify(message));
-            }
-        });
+        
+        peers.set(localAddress, peerInfo);
+        
+        console.log(`Peer registered: ${username} (${mode}) at ${localAddress} -> ${targetAddress}`);
+        
+        // Confirm registration
+        ws.send(JSON.stringify({
+            type: 'registered',
+            localAddress,
+            targetAddress
+        }));
+        
+        // Look for matching peer
+        this.findMatchingPeer(peerInfo);
     }
 
-    removeConnection(ws) {
-        if (ws.room && this.connections.has(ws.room)) {
-            const roomConnections = this.connections.get(ws.room);
-            const index = roomConnections.findIndex(conn => conn.ws === ws);
-            if (index !== -1) {
-                roomConnections.splice(index, 1);
-                if (roomConnections.length === 0) {
-                    this.connections.delete(ws.room);
-                    // Clean up TCP server if needed
-                    if (this.tcpClients.has(ws.room)) {
-                        this.tcpClients.get(ws.room).destroy();
-                        this.tcpClients.delete(ws.room);
+    findMatchingPeer(peerInfo) {
+        const { localAddress, targetAddress } = peerInfo;
+        
+        // Look for a peer whose local address matches our target address
+        // and whose target address matches our local address
+        for (const [address, peer] of peers) {
+            if (address === targetAddress && peer.targetAddress === localAddress && !peer.connected) {
+                console.log(`Found matching peer pair: ${localAddress} <-> ${targetAddress}`);
+                
+                // Mark both peers as connected
+                peerInfo.connected = true;
+                peer.connected = true;
+                
+                // Notify both peers
+                peerInfo.ws.send(JSON.stringify({
+                    type: 'peer-found',
+                    peerAddress: targetAddress,
+                    peerUsername: peer.username,
+                    peerMode: peer.mode
+                }));
+                
+                peer.ws.send(JSON.stringify({
+                    type: 'peer-found',
+                    peerAddress: localAddress,
+                    peerUsername: peerInfo.username,
+                    peerMode: peerInfo.mode
+                }));
+                
+                return;
+            }
+        }
+        
+        console.log(`No matching peer found for ${localAddress} -> ${targetAddress}`);
+    }
+
+    handleOffer(message) {
+        const { offer, targetAddress } = message;
+        const targetPeer = peers.get(targetAddress);
+        
+        if (targetPeer && targetPeer.ws.readyState === WebSocket.OPEN) {
+            console.log(`Forwarding offer to ${targetAddress}`);
+            targetPeer.ws.send(JSON.stringify({
+                type: 'offer',
+                offer
+            }));
+        } else {
+            console.warn(`Target peer ${targetAddress} not found or not connected`);
+        }
+    }
+
+    handleAnswer(message) {
+        const { answer, targetAddress } = message;
+        const targetPeer = peers.get(targetAddress);
+        
+        if (targetPeer && targetPeer.ws.readyState === WebSocket.OPEN) {
+            console.log(`Forwarding answer to ${targetAddress}`);
+            targetPeer.ws.send(JSON.stringify({
+                type: 'answer',
+                answer
+            }));
+        } else {
+            console.warn(`Target peer ${targetAddress} not found or not connected`);
+        }
+    }
+
+    handleIceCandidate(message) {
+        const { candidate, targetAddress } = message;
+        const targetPeer = peers.get(targetAddress);
+        
+        if (targetPeer && targetPeer.ws.readyState === WebSocket.OPEN) {
+            console.log(`Forwarding ICE candidate to ${targetAddress}`);
+            targetPeer.ws.send(JSON.stringify({
+                type: 'ice-candidate',
+                candidate
+            }));
+        } else {
+            console.warn(`Target peer ${targetAddress} not found or not connected`);
+        }
+    }
+
+    handleDisconnection(ws) {
+        // Find and remove the disconnected peer
+        for (const [address, peer] of peers) {
+            if (peer.ws === ws) {
+                console.log(`Peer disconnected: ${address}`);
+                
+                // Notify the connected peer if any
+                if (peer.connected) {
+                    const targetPeer = peers.get(peer.targetAddress);
+                    if (targetPeer && targetPeer.ws.readyState === WebSocket.OPEN) {
+                        targetPeer.ws.send(JSON.stringify({
+                            type: 'peer-disconnected',
+                            peerAddress: address
+                        }));
+                        targetPeer.connected = false;
                     }
                 }
+                
+                peers.delete(address);
+                break;
             }
         }
     }
 }
 
-// Start the bridge server
-new TCPWebRTCBridge();
+// Initialize signaling server
+new SignalingServer();
+
+// Start the server
+server.listen(PORT, () => {
+    console.log(`WebRTC P2P Signaling Server running on port ${PORT}`);
+    console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+    console.log('SIGTERM received, shutting down gracefully');
+    server.close(() => {
+        console.log('Process terminated');
+        process.exit(0);
+    });
+});
+
+process.on('SIGINT', () => {
+    console.log('SIGINT received, shutting down gracefully');
+    server.close(() => {
+        console.log('Process terminated');
+        process.exit(0);
+    });
+});
