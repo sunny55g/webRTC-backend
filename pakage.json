@@ -1,13 +1,27 @@
 
 {
-  "name": "tcp-ip-websocket-chat",
+  "name": "webrtc-tcp-messenger",
   "version": "1.0.0",
-  "description": "Simple TCP/IP WebSocket Chat Application",
+  "description": "WebRTC P2P Messenger with TCP Bridge",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node server.js",
+    "build": "echo 'No build process needed for static files'"
   },
   "dependencies": {
     "ws": "^8.14.2"
-  }
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "keywords": [
+    "webrtc",
+    "p2p",
+    "messaging",
+    "tcp",
+    "websocket"
+  ],
+  "author": "Your Name",
+  "license": "MIT"
 }
