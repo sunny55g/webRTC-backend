@@ -1,167 +1,209 @@
 require('dotenv').config();
-const express = require('express');
-const http = require('http');
-const cors = require('cors');
-const { MongoClient } = require('mongodb');
+
+const net = require('net');
 const WebSocket = require('ws');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
 
-const app = express();
-app.use(cors());
-
-const PORT = process.env.PORT || 3000;
-
-// MongoDB
-const mongoClient = new MongoClient(process.env.MONGO_URI);
-let messagesCollection;
-
-async function connectToMongo() {
-    try {
-        await mongoClient.connect();
-        const db = mongoClient.db("chatDB");
-        messagesCollection = db.collection("messages");
-        console.log("✅ MongoDB connected");
-    } catch (err) {
-        console.error("❌ MongoDB connection failed:");
-        console.error(err.stack);
-        process.exit(1);
+class TCPWebRTCBridge {
+    constructor() {
+        this.connections = new Map();
+        this.tcpClients = new Map();
+        this.setupWebSocketServer();
+        this.setupHTTPServer();
     }
-}
 
-connectToMongo();
+    setupWebSocketServer() {
+        this.wss = new WebSocket.Server({ port: 8081 });
+        console.log('WebSocket signaling server running on port 8081');
 
-app.get('/messages', async (req, res) => {
-    if (!messagesCollection) return res.status(500).send("MongoDB not ready");
-    const messages = await messagesCollection.find().sort({ timestamp: 1 }).toArray();
-    res.json(messages);
-});
+        this.wss.on('connection', (ws) => {
+            console.log('New WebSocket connection');
+            
+            ws.on('message', (data) => {
+                try {
+                    const message = JSON.parse(data);
+                    this.handleWebSocketMessage(ws, message);
+                } catch (error) {
+                    console.error('Error parsing WebSocket message:', error);
+                }
+            });
 
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+            ws.on('close', () => {
+                console.log('WebSocket connection closed');
+                this.removeConnection(ws);
+            });
 
-const clients = new Map();
-let clientIdCounter = 1;
-
-wss.on('connection', (ws) => {
-    const clientId = clientIdCounter++;
-    const clientData = { id: clientId, name: `User${clientId}`, target: null };
-    clients.set(ws, clientData);
-
-    ws.on('message', async (message) => {
-        try {
-            const data = JSON.parse(message.toString());
-            const client = clients.get(ws);
-
-            switch (data.type) {
-                case 'init':
-                    // Prevent name reuse
-                    for (let [otherWs, otherClient] of clients.entries()) {
-                        if (otherClient.name === data.name && otherWs !== ws) {
-                            ws.send(JSON.stringify({
-                                type: 'error',
-                                message: 'Name already in use. Please choose another.'
-                            }));
-                            ws.close();
-                            return;
-                        }
-                    }
-
-                    // Save client details
-                    client.name = data.name;
-                    client.target = `${data.targetIP}:${data.targetPort}`;
-                    console.log(`✅ ${client.name} connected (targeting ${client.target})`);
-
-                    ws.send(JSON.stringify({
-                        type: 'init',
-                        name: 'Server',
-                        isServer: true
-                    }));
-
-                    // Check for matching peer
-                    for (let [otherWs, otherClient] of clients.entries()) {
-                        if (
-                            otherWs !== ws &&
-                            otherClient.name === client.target &&
-                            otherClient.target === client.name
-                        ) {
-                            console.log(`🔁 Matched: ${client.name} ↔ ${otherClient.name}`);
-                            // Optionally notify both clients they are matched
-                        }
-                    }
-                    break;
-
-                case 'message':
-                    console.log(`💬 ${client.name} → ${client.target}: ${data.content}`);
-                    if (messagesCollection) {
-                        await messagesCollection.insertOne({
-                            sender: client.name,
-                            content: data.content,
-                            target: client.target,
-                            timestamp: new Date()
-                        });
-                    }
-
-                    for (let [otherWs, otherClient] of clients.entries()) {
-                        if (
-                            otherWs !== ws &&
-                            otherClient.target === client.target &&
-                            otherWs.readyState === WebSocket.OPEN
-                        ) {
-                            otherWs.send(JSON.stringify({
-                                type: 'message',
-                                sender: client.name,
-                                content: data.content,
-                                timestamp: new Date()
-                            }));
-                        }
-                    }
-                    break;
-case 'signal':
-    // Relay signaling to the client whose name matches this client's target
-    for (let [otherWs, otherClient] of clients.entries()) {
-        if (
-            otherClient.name === client.target &&
-            otherWs.readyState === WebSocket.OPEN
-        ) {
-            console.log(`📨 Relaying signal from ${client.name} to ${otherClient.name}`);
-            otherWs.send(JSON.stringify({
-                type: 'signal',
-                from: client.name,
-                data: data.data
-            }));
-        }
+            ws.on('error', (error) => {
+                console.error('WebSocket error:', error);
+            });
+        });
     }
-    break;
 
-
-                default:
-                    console.warn('Unknown message type:', data.type);
+    setupHTTPServer() {
+        const server = http.createServer((req, res) => {
+            let filePath = path.join(__dirname, req.url === '/' ? 'index.html' : req.url);
+            const extname = path.extname(filePath);
+            
+            let contentType = 'text/html';
+            switch (extname) {
+                case '.css': contentType = 'text/css'; break;
+                case '.js': contentType = 'text/javascript'; break;
+                case '.json': contentType = 'application/json'; break;
             }
-        } catch (err) {
-            console.error("❌ Error handling message:", err);
+
+            fs.readFile(filePath, (err, content) => {
+                if (err) {
+                    res.writeHead(404);
+                    res.end('File not found');
+                } else {
+                    res.writeHead(200, { 'Content-Type': contentType });
+                    res.end(content);
+                }
+            });
+        });
+
+        server.listen(3000, () => {
+            console.log('HTTP server running on http://localhost:3000');
+        });
+    }
+
+    handleWebSocketMessage(ws, message) {
+        switch (message.type) {
+            case 'join':
+                this.handleJoin(ws, message);
+                break;
+            case 'offer':
+            case 'answer':
+            case 'ice-candidate':
+                this.relaySignalingMessage(ws, message);
+                break;
+            case 'tcp-bridge':
+                this.handleTCPBridge(ws, message);
+                break;
         }
-    });
+    }
 
-    ws.on('close', () => {
-        const client = clients.get(ws);
-        console.log(`❌ ${client.name} disconnected`);
-        clients.delete(ws);
-    });
-
-    ws.send(JSON.stringify({
-        type: 'init',
-        name: 'Server',
-        isServer: true
-    }));
-});
-
-function broadcastMessage(sender, message) {
-    clients.forEach((_, ws) => {
-        if (ws !== sender && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify(message));
+    handleJoin(ws, message) {
+        const { room, username, isHost } = message;
+        
+        if (!this.connections.has(room)) {
+            this.connections.set(room, []);
         }
-    });
+        
+        const roomConnections = this.connections.get(room);
+        roomConnections.push({ ws, username, isHost });
+        
+        ws.room = room;
+        ws.username = username;
+        ws.isHost = isHost;
+
+        console.log(`${username} joined room ${room} as ${isHost ? 'host' : 'client'}`);
+
+        // Notify others in the room
+        roomConnections.forEach(conn => {
+            if (conn.ws !== ws) {
+                conn.ws.send(JSON.stringify({
+                    type: 'user-joined',
+                    username,
+                    isHost,
+                    room
+                }));
+            }
+        });
+
+        // Setup TCP server if this is a host
+        if (isHost) {
+            this.setupTCPServer(room);
+        }
+    }
+
+    relaySignalingMessage(senderWs, message) {
+        const room = message.room || senderWs.room;
+        if (!room || !this.connections.has(room)) return;
+
+        const roomConnections = this.connections.get(room);
+        roomConnections.forEach(conn => {
+            if (conn.ws !== senderWs && conn.ws.readyState === WebSocket.OPEN) {
+                conn.ws.send(JSON.stringify(message));
+            }
+        });
+    }
+
+    setupTCPServer(room) {
+        const [ip, port] = room.split(':');
+        const tcpPort = parseInt(port);
+
+        if (this.tcpClients.has(room)) {
+            return; // Already setup
+        }
+
+        const tcpServer = net.createServer((socket) => {
+            console.log(`TCP client connected to ${room}`);
+            
+            socket.on('data', (data) => {
+                // Forward TCP data to WebRTC clients
+                this.forwardToWebRTC(room, data.toString());
+            });
+
+            socket.on('close', () => {
+                console.log(`TCP client disconnected from ${room}`);
+            });
+
+            socket.on('error', (error) => {
+                console.error(`TCP socket error for ${room}:`, error);
+            });
+
+            // Store the socket for this room
+            this.tcpClients.set(room, socket);
+        });
+
+        tcpServer.listen(tcpPort, ip, () => {
+            console.log(`TCP server listening on ${ip}:${tcpPort}`);
+        });
+
+        tcpServer.on('error', (error) => {
+            console.error(`TCP server error for ${room}:`, error);
+        });
+    }
+
+    forwardToWebRTC(room, data) {
+        if (!this.connections.has(room)) return;
+
+        const message = {
+            type: 'tcp-message',
+            sender: 'TCP Client',
+            content: data.trim(),
+            timestamp: new Date().toISOString()
+        };
+
+        const roomConnections = this.connections.get(room);
+        roomConnections.forEach(conn => {
+            if (conn.ws.readyState === WebSocket.OPEN) {
+                conn.ws.send(JSON.stringify(message));
+            }
+        });
+    }
+
+    removeConnection(ws) {
+        if (ws.room && this.connections.has(ws.room)) {
+            const roomConnections = this.connections.get(ws.room);
+            const index = roomConnections.findIndex(conn => conn.ws === ws);
+            if (index !== -1) {
+                roomConnections.splice(index, 1);
+                if (roomConnections.length === 0) {
+                    this.connections.delete(ws.room);
+                    // Clean up TCP server if needed
+                    if (this.tcpClients.has(ws.room)) {
+                        this.tcpClients.get(ws.room).destroy();
+                        this.tcpClients.delete(ws.room);
+                    }
+                }
+            }
+        }
+    }
 }
 
-server.listen(PORT, () => {
-    console.log(`🚀 Server running on http://localhost:${PORT}`);
-});
+// Start the bridge server
+new TCPWebRTCBridge();
