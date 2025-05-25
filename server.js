@@ -1,28 +1,52 @@
 
+const express = require('express');
 const WebSocket = require('ws');
-const net = require('net');
+const http = require('http');
+const cors = require('cors');
 
-const PORT = process.env.PORT || 3000;
-const TCP_BRIDGE_PORT = process.env.TCP_BRIDGE_PORT || 8080;
+const app = express();
+const port = process.env.PORT || 3001;
 
-// WebSocket server for signaling
-const wss = new WebSocket.Server({ port: PORT });
+// Enable CORS for all routes
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Content-Type']
+}));
 
-// Store active connections and rooms
-const rooms = new Map();
-const connections = new Map();
+app.use(express.json());
 
-console.log(`WebRTC Signaling Server running on port ${PORT}`);
-console.log(`TCP Bridge listening on port ${TCP_BRIDGE_PORT}`);
+// Create HTTP server
+const server = http.createServer(app);
 
-// WebSocket signaling server
-wss.on('connection', (ws) => {
-    console.log('New WebSocket connection');
+// Create WebSocket server
+const wss = new WebSocket.Server({ server });
+
+// Store connected clients with their connection info
+const clients = new Map();
+
+// Basic HTTP endpoint for health check
+app.get('/', (req, res) => {
+    res.json({ 
+        message: 'WebRTC Signaling Server',
+        status: 'running',
+        connectedClients: clients.size
+    });
+});
+
+app.get('/health', (req, res) => {
+    res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+});
+
+wss.on('connection', (ws, req) => {
+    console.log('New WebSocket connection from:', req.socket.remoteAddress);
     
-    ws.on('message', (message) => {
+    ws.on('message', (data) => {
         try {
-            const data = JSON.parse(message);
-            handleSignalingMessage(ws, data);
+            const message = JSON.parse(data.toString());
+            console.log('Received message:', message.type, 'from client');
+            
+            handleSignalingMessage(ws, message);
         } catch (error) {
             console.error('Error parsing message:', error);
             ws.send(JSON.stringify({
@@ -33,39 +57,42 @@ wss.on('connection', (ws) => {
     });
     
     ws.on('close', () => {
-        console.log('WebSocket connection closed');
-        // Remove from rooms and connections
-        for (const [roomId, clients] of rooms) {
-            const index = clients.indexOf(ws);
-            if (index > -1) {
-                clients.splice(index, 1);
-                if (clients.length === 0) {
-                    rooms.delete(roomId);
-                }
+        console.log('Client disconnected');
+        // Remove client from clients map
+        for (const [key, client] of clients) {
+            if (client.ws === ws) {
+                clients.delete(key);
+                console.log(`Removed client with key: ${key}`);
                 break;
             }
         }
-        connections.delete(ws);
+    });
+    
+    ws.on('error', (error) => {
+        console.error('WebSocket error:', error);
     });
 });
 
-function handleSignalingMessage(ws, data) {
-    console.log('Signaling message:', data.type);
-    
-    switch (data.type) {
-        case 'join':
-            handleJoin(ws, data);
+function handleSignalingMessage(ws, message) {
+    switch (message.type) {
+        case 'register':
+            handleRegister(ws, message);
             break;
+            
         case 'offer':
-            handleOffer(ws, data);
+            handleOffer(ws, message);
             break;
+            
         case 'answer':
-            handleAnswer(ws, data);
+            handleAnswer(ws, message);
             break;
+            
         case 'ice-candidate':
-            handleIceCandidate(ws, data);
+            handleIceCandidate(ws, message);
             break;
+            
         default:
+            console.log('Unknown message type:', message.type);
             ws.send(JSON.stringify({
                 type: 'error',
                 message: 'Unknown message type'
@@ -73,151 +100,122 @@ function handleSignalingMessage(ws, data) {
     }
 }
 
-function handleJoin(ws, data) {
-    const { room, name, mode, targetAddress } = data;
+function handleRegister(ws, message) {
+    const { username, targetAddress, mode } = message;
+    const clientKey = `${username}@${targetAddress}`;
     
-    connections.set(ws, { room, name, mode, targetAddress });
+    console.log(`Registering client: ${clientKey} as ${mode}`);
     
-    if (!rooms.has(room)) {
-        rooms.set(room, []);
-    }
-    
-    rooms.get(room).push(ws);
-    
-    console.log(`${name} joined room ${room} as ${mode}`);
-    
-    // Notify others in the room
-    const roomClients = rooms.get(room);
-    roomClients.forEach(client => {
-        if (client !== ws && client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({
-                type: 'user-joined',
-                name: name,
-                mode: mode,
-                targetAddress: targetAddress
-            }));
-        }
+    clients.set(clientKey, {
+        ws: ws,
+        username: username,
+        targetAddress: targetAddress,
+        mode: mode
     });
     
     ws.send(JSON.stringify({
-        type: 'joined',
-        room: room,
-        clients: roomClients.length
+        type: 'registered',
+        message: `Registered as ${mode} for ${targetAddress}`
     }));
 }
 
-function handleOffer(ws, data) {
-    const { offer, targetAddress, senderName } = data;
-    const senderInfo = connections.get(ws);
+function handleOffer(ws, message) {
+    const { offer, targetAddress } = message;
     
-    if (!senderInfo) return;
+    console.log(`Relaying offer to target: ${targetAddress}`);
     
-    const roomClients = rooms.get(senderInfo.room);
-    if (!roomClients) return;
+    // Find the target client by their targetAddress
+    const targetClient = findClientByTargetAddress(targetAddress);
     
-    // Send offer to all receivers in the room
-    roomClients.forEach(client => {
-        const clientInfo = connections.get(client);
-        if (client !== ws && 
-            client.readyState === WebSocket.OPEN && 
-            clientInfo && 
-            clientInfo.mode === 'receiver') {
-            
-            client.send(JSON.stringify({
-                type: 'offer',
-                offer: offer,
-                senderName: senderName,
-                targetAddress: targetAddress
-            }));
-        }
-    });
+    if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
+        targetClient.ws.send(JSON.stringify({
+            type: 'offer',
+            offer: offer
+        }));
+        console.log('Offer relayed successfully');
+    } else {
+        console.log('Target client not found or not connected');
+        ws.send(JSON.stringify({
+            type: 'error',
+            message: 'Target peer not found or not connected'
+        }));
+    }
 }
 
-function handleAnswer(ws, data) {
-    const { answer, targetAddress, receiverName } = data;
-    const receiverInfo = connections.get(ws);
+function handleAnswer(ws, message) {
+    const { answer, targetAddress } = message;
     
-    if (!receiverInfo) return;
+    console.log(`Relaying answer to target: ${targetAddress}`);
     
-    const roomClients = rooms.get(receiverInfo.room);
-    if (!roomClients) return;
+    // Find the target client by their targetAddress
+    const targetClient = findClientByTargetAddress(targetAddress);
     
-    // Send answer to the sender
-    roomClients.forEach(client => {
-        const clientInfo = connections.get(client);
-        if (client !== ws && 
-            client.readyState === WebSocket.OPEN && 
-            clientInfo && 
-            clientInfo.mode === 'sender') {
-            
-            client.send(JSON.stringify({
-                type: 'answer',
-                answer: answer,
-                receiverName: receiverName
-            }));
-        }
-    });
+    if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
+        targetClient.ws.send(JSON.stringify({
+            type: 'answer',
+            answer: answer
+        }));
+        console.log('Answer relayed successfully');
+    } else {
+        console.log('Target client not found or not connected');
+        ws.send(JSON.stringify({
+            type: 'error',
+            message: 'Target peer not found or not connected'
+        }));
+    }
 }
 
-function handleIceCandidate(ws, data) {
-    const { candidate, targetAddress, senderName } = data;
-    const senderInfo = connections.get(ws);
+function handleIceCandidate(ws, message) {
+    const { candidate, targetAddress } = message;
     
-    if (!senderInfo) return;
+    console.log(`Relaying ICE candidate to target: ${targetAddress}`);
     
-    const roomClients = rooms.get(senderInfo.room);
-    if (!roomClients) return;
+    // Find the target client by their targetAddress
+    const targetClient = findClientByTargetAddress(targetAddress);
     
-    // Send ICE candidate to other clients
-    roomClients.forEach(client => {
-        if (client !== ws && client.readyState === WebSocket.OPEN) {
-            client.send(JSON.stringify({
-                type: 'ice-candidate',
-                candidate: candidate,
-                senderName: senderName
-            }));
-        }
-    });
+    if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
+        targetClient.ws.send(JSON.stringify({
+            type: 'ice-candidate',
+            candidate: candidate
+        }));
+        console.log('ICE candidate relayed successfully');
+    } else {
+        console.log('Target client not found for ICE candidate');
+        // ICE candidates can fail silently as they're not critical
+    }
 }
 
-// TCP Bridge Server for external applications
-const tcpServer = net.createServer((socket) => {
-    console.log('TCP client connected:', socket.remoteAddress);
+function findClientByTargetAddress(targetAddress) {
+    // Look for clients whose target address matches the given address
+    // This is a simplified matching - in production you might want more sophisticated matching
+    for (const [key, client] of clients) {
+        if (key.includes(targetAddress) || client.targetAddress === targetAddress) {
+            return client;
+        }
+    }
     
-    socket.on('data', (data) => {
-        const message = data.toString().trim();
-        console.log('TCP received:', message);
-        
-        // Broadcast to WebRTC clients
-        // This is a simple bridge - you can enhance this based on your needs
-        wss.clients.forEach(client => {
-            if (client.readyState === WebSocket.OPEN) {
-                client.send(JSON.stringify({
-                    type: 'tcp-message',
-                    content: message,
-                    sender: 'TCP-App'
-                }));
-            }
-        });
-    });
+    // Also try reverse lookup - if someone is targeting us
+    for (const [key, client] of clients) {
+        const [username, address] = key.split('@');
+        if (address === targetAddress) {
+            return client;
+        }
+    }
     
-    socket.on('close', () => {
-        console.log('TCP client disconnected');
-    });
-    
-    socket.on('error', (error) => {
-        console.error('TCP socket error:', error);
-    });
+    return null;
+}
+
+server.listen(port, () => {
+    console.log(`🚀 WebRTC Signaling Server running on port ${port}`);
+    console.log(`📡 WebSocket endpoint: ws://localhost:${port}`);
+    console.log(`🌐 HTTP endpoint: http://localhost:${port}`);
 });
 
-tcpServer.listen(TCP_BRIDGE_PORT, () => {
-    console.log(`TCP Bridge Server listening on port ${TCP_BRIDGE_PORT}`);
-});
-
-// Handle server shutdown
+// Graceful shutdown
 process.on('SIGINT', () => {
-    console.log('Shutting down server...');
-    wss.close();
-    tcpServer.close();
-    process.exit(0);
+    console.log('\n📡 Shutting down server gracefully...');
+    server.close(() => {
+        console.log('✅ Server closed');
+        process.exit(0);
+    });
 });
